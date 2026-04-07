@@ -235,16 +235,108 @@ conversation that chose it.
       6. **Mutation testing** — slither-mutate, 302/302 killable
          mutants caught (100%)
 
+### Session 3 — adversarial review (a different Claude session, no shared state)
+
+This is the part of the timeline that wasn't supposed to exist. After session 2 ended with all six tiers green and the contract pushed to GitHub, the author opened a fresh Claude Code session in their home directory and asked it to attack the contract instead of verify it. The session had no access to the previous prompt history, no knowledge of the test suite design, and no priors about what the contract should do — only the README's claims.
+
+- **User:** *"review the git repo of mine (dreliq9) called headless with 2 other evaluator agents"*
+  - Claude invoked the `/qa-hard` skill (rigorous 3-evaluator adversarial review modeled on a specialist-loop pipeline). Pulled the contract and tests via the GitHub MCP, then dispatched three evaluator agents in parallel. Each evaluator was given the same spec and file list but worked in isolation — no cross-contamination. Each was instructed to read the entire contract (~480 lines), evaluate across seven dimensions (spec compliance, correctness, reasoning quality, missed concerns, false alarms, code quality, communication quality), severity-calibrate findings, and grade the contract A through F.
+  - **All three evaluators independently graded the contract `D`.** All three identified the same critical bug, traced the same exact attack path, and pointed at the same lines (`Headless.sol:148` mint, `:302-327` redeem). The bug:
+    > The deployer mints 3,000,000 HDLS at construction. `tokensSold` starts at 0. As soon as Alice calls `buy(100)`, `tokensSold` becomes 100. The deployer can then call `redeem(100)` against their own pre-mined allocation — both guards (`balanceOf(self) >= 100` and `100 <= tokensSold`) pass, the burn comes out of the founder's 3M, and the refund (≈ Alice's payment minus fees) flows to the founder. Alice still holds 100 HDLS but `tokensSold == 0`, so her own subsequent `redeem` reverts. The deployer has just front-run a buyer's exit using a token they minted for free.
+  - The README's "founder is mechanically last in line on exit" claim was structurally false. The `tokensSold` counter was a supply guard, not an ordering guard, and the test author had conflated the two.
+  - **The damning evidence**: the unit test `test_FounderCannotRedeemBelowBaseline` actually demonstrates the exploit succeeding while the test asserts only that the founder can't redeem *more* afterward. Reading the test name, you'd conclude the founder was locked out. The author tested the wrong property and confidently named the test for what they thought they had tested. Every tier of the verification stack greenlit the bug because every tier was anchored to the same test.
+  - Claude then ran phase 3 (isolated weighing of each evaluator's report quality), phase 4 (synthesis with confidence tiers — HIGH/MAJORITY/CONTESTED/UNIQUE), and phase 5 (presented a synthesis report with severity-calibrated findings to the user). Synthesis grade: `D`, high confidence.
+- **User:** *"fix all"*
+  - Claude cloned the repo to `/tmp/headless`, ran `forge test` to confirm the 54-test baseline passed, then applied the founder-taint lock fix:
+    1. Added a `FounderTaintLocked` error and `mapping(address => uint256) public founderTaint`.
+    2. Initialized `founderTaint[msg.sender] = FOUNDER_ALLOCATION` in the constructor.
+    3. Overrode `_update` (the unified OZ ERC20 hook) to propagate taint proportionally on every account-to-account transfer. Round UP for stickiness, capped at the sender's current taint, no movement on mint or burn. The reasoning: burns are gated by the redeem precondition below, so taint never needs to move on burn; transfers must move taint or the founder could escape via a fresh address; mints can't create taint because the only mint that ever does is the founder mint in the constructor.
+    4. Added a precondition in `redeem`: `if (balanceOf(msg.sender) - amount < founderTaint[msg.sender]) revert FounderTaintLocked();`. The founder cannot burn into their tainted balance.
+    5. Added a `tokensSold > 0` gate in `claimAuction` to close the deploy-block self-rebate (the auction otherwise opened in the deploy block with no holders to receive the rebased premium).
+  - Then rewrote the test file:
+    - **Removed** the misleading `test_FounderCannotRedeemBelowBaseline` (it celebrated the exploit as a passing test).
+    - Added four new tests:
+      - `test_FounderCannotDrainBuyerDirect` — founder calls `redeem` directly → reverts.
+      - `test_FounderCannotDrainBuyerViaTransfer` — founder transfers 3M to bob → bob's `redeem` reverts. Proves taint propagates.
+      - `test_FounderCanRedeemBoughtTokens` — founder buys 50 fresh tokens via the curve → can redeem exactly those 50, not one wei into the allocation.
+      - `test_FounderTaintPropagatesProportionally` — partial transfer splits taint with sticky rounding.
+    - Added a `_seedCurveForAuction()` helper + `seeded` modifier; applied it to the 10 auction tests that needed `tokensSold > 0` after the new gate.
+  - Then rewrote the invariant test file:
+    - The handler now constructs the token itself, making the founder == handler, and adds `address(this)` as **actor 0**. Every redeem call with `seed % 6 == 0` is the founder attempting to drain.
+    - The redeem handler is wrapped in `try/catch` so taint-locked attempts don't pollute ghost variables.
+    - **Replaced** the previously-stub `invariant_EveryActorCanExitToPoolRoom` (whose body just re-asserted the aggregate `balance ≥ curveBackingRequired` check, which holds vacuously after a drain) with a real per-holder solvency check:
+      ```solidity
+      for each actor:
+          assertLe(founderTaint[actor], balanceOf(actor));
+      sumNonTainted += balanceOf(actor) - founderTaint[actor];
+      assertEq(sumNonTainted, tokensSold);
+      assertGe(address(token).balance, curveBackingRequired());
+      ```
+      This is the property that catches a founder drain: Alice's non-tainted balance would remain positive while `tokensSold` dropped to zero — a contradiction the assertion would flag.
+  - Re-ran the full stack: **57/57 unit tests pass, 10/10 invariants pass × 1.28M handler calls, 4/4 Halmos symbolic proofs pass**, Slither unchanged. The taint lock and per-holder invariant work end-to-end.
+- **User:** *"fix moderate issues as well"*
+  - Claude applied the four moderate findings flagged during the synthesis phase:
+    1. **Half-open auction window.** Changed `claimAuction` and `auctionPriceAt` to `[openBlock, openBlock + WINDOW)` instead of inclusive. The previous inclusive close block had premium = 0, allowing a fee-free 1000-HDLS mint on the final block — broke the "every trade pays a spread" symmetry. New `test_AuctionExpiredAtCloseBlock` proves the exclusion; the renamed `test_AuctionClaimableAtLastBlockBeforeClose` covers the inclusive end. `test_AuctionPriceDecaysLinearly` updated to assert `priceLast > base`.
+    2. **L2 block-time sensitivity.** Converted `AUCTION_INTERVAL` and `AUCTION_WINDOW` from `constant` to `immutable` constructor parameters with `InvalidAuctionConfig` validation (`> 0`, `window <= interval`). `Deploy.s.sol` now documents recommended values for L1 (25, 25), Base/OP (150, 150), and Arbitrum (1200, 1200), and passes 25/25 as defaults. All test setUps updated to pass `(25, 25)`.
+    3. **`twapCurveBase` input validation.** Added a `TwapNotChronological` named error rejecting `priorBlock > block.number` and `priorCumulative > nowCumulative` — the function previously underflow-reverted on bad inputs.
+    4. **`Donated` event in `receive()`.** Added `event Donated(address indexed from, uint256 amount)` and emit it from `receive()` (gated on `msg.value > 0` so the buy/claimAuction overpayment refund path doesn't double-emit).
+  - One moderate finding (`auctionPriceAt` baseCost drift mid-window) was documented via a strong NatSpec ⚠ block instead of fixed via snapshotting — a snapshot mechanism would require per-auction state for an agent-UX issue, not a correctness one, and the natural overpayment-refund path already protects callers.
+  - Re-ran the full stack: **58/58 unit tests pass** (added the close-block expiry test, removed the misleading test = +4 net since session start), **10/10 invariants pass × 1.28M calls**, **4/4 Halmos proofs pass**, Slither unchanged.
+- **User:** *(approval to push the branch and open a PR)*
+  - Claude branched `fix/founder-taint-lock` off main, committed all changes with a detailed message naming the critical finding and the four moderate fixes, pushed to `dreliq9/headless`, and opened [PR #1](https://github.com/dreliq9/headless/pull/1) via the GitHub MCP. The PR body documents the attack path, the fix, and the verification stack results post-fix.
+
+### Session 4 — repositioning as research artifact
+
+After the fix landed, the author and Claude discussed what to actually do with the repository. The original framing — "an autonomous agent-native token, six-tier verified, non-rug, fair launch" — could not survive the historical critical finding without disclosure. The question was whether to (a) bring the contract to market as a token, (b) productize the verification methodology as a service, or (c) reposition the whole repo as a research artifact / case study.
+
+The analysis: bringing the contract to market would require a real audit (~$15k–$60k), a crypto lawyer (legal exposure on the founder allocation under any reasonable Howey reading), bootstrap liquidity, distribution, monitoring, incident response, and an answer to "why would anyone hold this." The analysis flagged the founder allocation as the legal hot potato regardless of technical fixes — the taint lock prevents an economic rug but does nothing for the legal claim that the founder received tokens expecting profit from others' efforts. The pragmatic recommendation was option (c): reposition.
+
+- **User:** *(approved the repositioning)*
+  - Claude rewrote `README.md` from "verified token" framing to "research artifact" framing:
+    - New top-of-file framing sentence: *"A one-week experiment in AI-authored smart contract development and the verification gaps of AI-driven verification."*
+    - New first content section ("What this repository actually is") positioning the bug discovery as the load-bearing finding, not the contract itself.
+    - New "Historical critical finding" section walking through the attack path, the per-tier failure analysis, and the fix.
+    - New "Bounds and disclosures the original README didn't make explicit" subsection acknowledging the Halmos ≤100 ether bound, single-actor symbolic proofs, mutation-testing-measures-coverage-not-correctness, and L1-block-time sensitivity.
+    - New "Load-bearing invariant" subsection making explicit that the original aggregate invariant was necessary but not sufficient, and that the per-holder version added in PR #1 is the actual safety property.
+    - New "What v2 should look like" section listing eight forward-looking design notes for any future iteration — sub-whole-token denomination, slippage-bounded primitives, commit-reveal auctions, simulate-without-mutate views, proof-of-reserves API, max-buy-for-slippage, per-actor solvency from day one, adversarial review as a verification tier.
+    - New "Reproduce the historical bug" instruction in the verify-yourself section so any reader can run `git checkout f1d793c~1 && forge test --match-test test_FounderCannotRedeemBelowBaseline -vv` and watch the test pass while the founder drains alice's deposit.
+    - Strengthened the safety section to explicitly note that the verification stack failed to catch the critical finding when run as positive verification, and that automated stacks catch what they're told to look for.
+    - Removed "non-rug" and "formally verified" as standalone adjectives.
+  - This file (PROMPTS.md) was extended with sessions 3 and 4 in the same per-prompt format as sessions 1 and 2, so the full provenance trail is unbroken.
+
 ## What future sessions should preserve
 
-If anyone edits this contract — human or AI — two things must stay true
+If anyone edits this contract — human or AI — three things must stay true
 for the "headless" name to keep earning itself:
 
 1. **No admin, no owner, no upgrade path, no privileged role.** Not even
    a pause. Not even an emergency withdraw. Not even a parameter knob.
-2. **The invariant:** `address(this).balance >= curveIntegral(0, tokensSold)`
+2. **The aggregate invariant:** `address(this).balance >= curveIntegral(0, tokensSold)`
    must be preserved by every externally-callable mutating function,
    including any new ones. The internal `_rebase()` tightens this to
    equality; any new code path must call it before returning.
+3. **Per-holder solvency** (added after the session 3 finding): every
+   holder's non-tainted balance must be redeemable from the contract's
+   ETH backing. The aggregate invariant alone is necessary but not
+   sufficient — it holds vacuously after a drain that takes `tokensSold`
+   to zero. The taint-lock mechanism in `_update` plus the redeem
+   precondition `balance - amount >= founderTaint[caller]` is the
+   load-bearing enforcement; the per-holder invariant in
+   `HeadlessInvariant.t.sol` is the load-bearing test. **Do not loosen
+   either without a successor mechanism that preserves the property
+   that no actor can take ETH that backs another actor's tokens.**
 
 Everything else is negotiable.
+
+The deeper methodological lesson, kept here as a permanent footnote so
+nobody who works on this file in the future has to relearn it: **the
+contract author and the test author cannot be the same agent on the
+same session.** Session 2 produced both the contract and the
+verification stack, both of which were confidently wrong about the same
+property. Session 3 was a different Claude session asked to argue
+against the artifact rather than verify it, and found the bug on the
+first pass. If you (a future AI session, or a future human) are about
+to claim a contract is verified, schedule a separate session whose
+only job is to attack the claims of the verifying session. The
+adversarial pass is the cheapest tier in any verification stack and
+was the only one that worked here.
