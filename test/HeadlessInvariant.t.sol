@@ -42,8 +42,15 @@ contract HeadlessHandler is Test {
         vm.stopPrank();
     }
 
-    constructor(Headless _token) {
-        token = _token;
+    constructor() {
+        // The handler itself deploys the token, so the founder address is
+        // `address(this)` (the handler). This puts the founder inside the
+        // actor set as actor 0 — a regression-driver for the founder-drain
+        // bug that earlier handlers missed because their actors were all
+        // keccak-derived addresses with no founder taint.
+        token = new Headless(25, 25);
+        actors.push(address(this));
+        vm.deal(address(this), 1_000_000 ether);
         for (uint256 i = 0; i < 5; i++) {
             address a = address(uint160(uint256(keccak256(abi.encode("actor", i))) | 1));
             vm.deal(a, 1_000_000 ether);
@@ -79,9 +86,15 @@ contract HeadlessHandler is Test {
         if (amount == 0 || amount > token.tokensSold()) return;
 
         (uint256 refund, , ) = token.quoteRedeem(amount);
-        ghost_totalEthOut += refund;
-        ghost_redeemCalls++;
-        token.redeem(amount);
+
+        // The founder actor carries taint; their redemptions may revert with
+        // `FounderTaintLocked`. Wrap so failed calls do not pollute ghosts.
+        try token.redeem(amount) {
+            ghost_totalEthOut += refund;
+            ghost_redeemCalls++;
+        } catch {
+            // Expected for taint-locked founder attempts. Ghosts unchanged.
+        }
     }
 
     function claimAuction(uint256 seed) external useActor(seed) {
@@ -121,8 +134,8 @@ contract HeadlessInvariantTest is StdInvariant, Test {
     HeadlessHandler public handler;
 
     function setUp() public {
-        token = new Headless();
-        handler = new HeadlessHandler(token);
+        handler = new HeadlessHandler();
+        token = handler.token();
 
         // Tell the invariant runner to only call methods on the handler.
         targetContract(address(handler));
@@ -226,18 +239,46 @@ contract HeadlessInvariantTest is StdInvariant, Test {
         );
     }
 
-    /// @notice No actor can ever be short ETH at the contract level: the sum
-    ///         of every actor's token balance * current-refund-for-that-size
-    ///         must be bounded by the contract's actual ETH balance. This is
-    ///         a stricter version of `invariant_BackingCoversCurveIntegral`:
-    ///         it asserts the invariant per-actor instead of globally.
+    /// @notice Per-actor solvency: every actor's non-tainted (curve-backed)
+    ///         balance must remain redeemable. Two pieces:
+    ///
+    ///           1. No actor's `founderTaint` may exceed their `balanceOf`.
+    ///              If it did, taint accounting has drifted and the redeem
+    ///              guard `balance - amount >= taint` could allow a burn
+    ///              that should have been blocked.
+    ///
+    ///           2. The aggregate sum of (balance - taint) across all actors
+    ///              must equal `tokensSold`. This is the load-bearing
+    ///              property: every curve-backed token is held by exactly
+    ///              one actor as a non-tainted balance, and the global
+    ///              backing covers exactly that quantity.
+    ///
+    ///         The earlier version of this invariant just re-asserted the
+    ///         global aggregate check, which holds vacuously after a
+    ///         founder drain (`required = 0` once `tokensSold = 0`). The
+    ///         per-actor version catches the drain because Alice's
+    ///         non-tainted balance would remain positive while `tokensSold`
+    ///         dropped to zero — a contradiction the assertion would flag.
     function invariant_EveryActorCanExitToPoolRoom() public view {
-        uint256 balance = address(token).balance;
-        // The curve refund for ALL outstanding curve tokens must fit inside
-        // the current balance (this is exactly `curveBackingRequired`, but
-        // asserted here as a per-invariant sanity check at the actor level).
-        uint256 required = token.curveBackingRequired();
-        assertGe(balance, required, "per-actor exit unfunded");
+        uint256 nActors = handler.numActors();
+        uint256 sumNonTainted;
+        for (uint256 i = 0; i < nActors; i++) {
+            address actor = handler.actors(i);
+            uint256 bal   = token.balanceOf(actor);
+            uint256 taint = token.founderTaint(actor);
+            assertLe(taint, bal, "founder taint exceeds balance");
+            sumNonTainted += bal - taint;
+        }
+        // Every curve-backed token must be held as a non-tainted balance
+        // by some actor. The actor set is exhaustive in this test, so this
+        // is an exact equality.
+        assertEq(sumNonTainted, token.tokensSold(), "non-tainted sum != tokensSold");
+        // Backing must still cover the curve.
+        assertGe(
+            address(token).balance,
+            token.curveBackingRequired(),
+            "backing < curve requirement"
+        );
     }
 
     // ════════════════════════════════════════════════════════════════════

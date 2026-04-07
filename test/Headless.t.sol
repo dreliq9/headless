@@ -16,8 +16,26 @@ contract HeadlessTest is Test {
         return address(token).balance >= token.curveBackingRequired();
     }
 
+    /// @dev Seed the curve with a tiny buy from a fresh address so the
+    ///      `tokensSold > 0` auction gate is satisfied. Used by every
+    ///      auction test that does not explicitly buy first. Uses a
+    ///      dedicated seeder address so existing actor balances are
+    ///      unaffected.
+    function _seedCurveForAuction() internal {
+        address seeder = address(0xDEED);
+        vm.deal(seeder, 10 ether);
+        (uint256 total, , ) = token.quoteBuy(1 ether);
+        vm.prank(seeder);
+        token.buy{value: total}(1 ether);
+    }
+
+    modifier seeded() {
+        _seedCurveForAuction();
+        _;
+    }
+
     function setUp() public {
-        token = new Headless();
+        token = new Headless(25, 25);
         vm.deal(alice, 1_000 ether);
         vm.deal(bob,   1_000 ether);
         vm.deal(carol, 1_000 ether);
@@ -117,22 +135,105 @@ contract HeadlessTest is Test {
         token.redeem(1 ether);
     }
 
-    function test_FounderCannotRedeemBelowBaseline() public {
+    /// @notice The founder must NOT be able to drain a buyer's deposit by
+    ///         redeeming their pre-minted 3% allocation against tokensSold.
+    ///         This is the load-bearing "founder is mechanically last in
+    ///         line" promise from the README. Direct attempt by founder.
+    function test_FounderCannotDrainBuyerDirect() public {
         uint256 amount = 100 ether;
         (uint256 total, , ) = token.quoteBuy(amount);
         vm.prank(alice);
         token.buy{value: total}(amount);
 
+        // Founder holds the 3M allocation, all of it tainted. Any redeem
+        // attempt must revert because the post-burn balance would dip below
+        // the taint floor.
+        vm.prank(deployer);
+        vm.expectRevert(Headless.FounderTaintLocked.selector);
+        token.redeem(amount);
+
+        // Alice's deposit and redemption rights are intact.
+        assertEq(token.tokensSold(), amount);
+        assertEq(token.balanceOf(alice), amount);
+        vm.prank(alice);
+        token.redeem(amount);
+        assertEq(token.tokensSold(), 0);
+    }
+
+    /// @notice Founder cannot escape the lock by transferring their allocation
+    ///         to a fresh address — taint propagates on every transfer (rounded
+    ///         UP for stickiness).
+    function test_FounderCannotDrainBuyerViaTransfer() public {
+        uint256 amount = 100 ether;
+        (uint256 total, , ) = token.quoteBuy(amount);
+        vm.prank(alice);
+        token.buy{value: total}(amount);
+
+        // Founder routes their allocation through bob.
         vm.prank(deployer);
         token.transfer(bob, token.FOUNDER_ALLOCATION());
 
+        // Bob now carries all 3M of taint.
+        assertEq(token.founderTaint(bob), token.FOUNDER_ALLOCATION());
+        assertEq(token.founderTaint(deployer), 0);
+
         vm.prank(bob);
+        vm.expectRevert(Headless.FounderTaintLocked.selector);
         token.redeem(amount);
 
-        assertEq(token.tokensSold(), 0);
-        vm.prank(bob);
-        vm.expectRevert(Headless.InsufficientCurveSupply.selector);
+        // Alice's position is intact and redeemable.
+        assertEq(token.tokensSold(), amount);
+        vm.prank(alice);
+        token.redeem(amount);
+    }
+
+    /// @notice Founder may redeem tokens they purchased via the curve, but
+    ///         not their tainted founder allocation. The taint check uses
+    ///         `balance - amount >= taint`, so the founder can burn down
+    ///         to (but not below) their taint floor.
+    function test_FounderCanRedeemBoughtTokens() public {
+        // Alice seeds the curve so the founder can buy and then redeem.
+        uint256 alicesBuy = 100 ether;
+        (uint256 aliceTotal, , ) = token.quoteBuy(alicesBuy);
+        vm.prank(alice);
+        token.buy{value: aliceTotal}(alicesBuy);
+
+        // Founder buys 50 fresh tokens through the curve.
+        uint256 founderBuy = 50 ether;
+        (uint256 founderTotal, , ) = token.quoteBuy(founderBuy);
+        vm.deal(deployer, founderTotal);
+        vm.prank(deployer);
+        token.buy{value: founderTotal}(founderBuy);
+
+        // Founder taint stays at 3M (unchanged by buy/mint), but balance
+        // is now 3M + 50, so they can redeem up to 50.
+        assertEq(token.founderTaint(deployer), token.FOUNDER_ALLOCATION());
+
+        vm.prank(deployer);
+        token.redeem(founderBuy); // exactly the bought amount — should pass
+
+        // Trying to redeem one more wei into the founder allocation reverts.
+        vm.prank(deployer);
+        vm.expectRevert(Headless.FounderTaintLocked.selector);
         token.redeem(1 ether);
+    }
+
+    /// @notice Taint propagates proportionally on partial transfers and
+    ///         remains sticky (rounds up) so the founder cannot dilute it.
+    function test_FounderTaintPropagatesProportionally() public {
+        // Founder sends half their allocation to bob.
+        uint256 half = token.FOUNDER_ALLOCATION() / 2;
+        vm.prank(deployer);
+        token.transfer(bob, half);
+
+        // Both parties now hold ≥ proportional taint.
+        assertGe(token.founderTaint(deployer), half);
+        assertGe(token.founderTaint(bob), half);
+        // Conservation modulo round-up (taint should never be lost on transfer).
+        assertGe(
+            token.founderTaint(deployer) + token.founderTaint(bob),
+            token.FOUNDER_ALLOCATION()
+        );
     }
 
     // ───────────────────── CONTINUOUS REBASE / FEES ────────────────────
@@ -199,7 +300,8 @@ contract HeadlessTest is Test {
         uint256 anchor = token.launchBlock();
         uint256 window = token.AUCTION_WINDOW();
         uint256 midTarget = anchor + window / 2;
-        uint256 endTarget = anchor + window;
+        // Last claimable block (window is half-open).
+        uint256 lastTarget = anchor + window - 1;
 
         uint256 priceAtOpen = token.auctionPrice(id);
 
@@ -207,30 +309,35 @@ contract HeadlessTest is Test {
         uint256 priceMid = token.auctionPrice(id);
         assertLt(priceMid, priceAtOpen);
 
-        vm.roll(endTarget);
-        uint256 priceEnd = token.auctionPrice(id);
+        vm.roll(lastTarget);
+        uint256 priceLast = token.auctionPrice(id);
         (, uint256 base, ) = token.quoteBuy(token.AUCTION_SIZE());
-        assertEq(priceEnd, base);
+        // Premium has decayed to its minimum non-zero value: 1 step out of
+        // WINDOW remains, so the premium is exactly maxPremium / WINDOW.
+        assertLt(priceLast, priceMid);
+        assertGt(priceLast, base);
     }
 
-    function test_ClaimAuctionMintsAndRebases() public {
+    function test_ClaimAuctionMintsAndRebases() public seeded {
         uint256 id = token.currentAuctionId();
         uint256 priceAtOpen = token.auctionPrice(id);
+        uint256 soldBefore = token.tokensSold();
 
         uint256 baseBefore = token.curveBase();
         vm.prank(alice);
         token.claimAuction{value: priceAtOpen}(id);
 
         assertEq(token.balanceOf(alice), token.AUCTION_SIZE());
-        assertEq(token.tokensSold(),     token.AUCTION_SIZE());
+        assertEq(token.tokensSold(),     soldBefore + token.AUCTION_SIZE());
         assertTrue(token.auctionClaimed(id));
         // Premium was rebased → curveBase rose.
         assertGt(token.curveBase(), baseBefore);
-        // Invariant tight.
-        assertEq(address(token).balance, token.curveBackingRequired());
+        // Invariant: backing covers required (within sub-gwei rebase residual).
+        assertGe(address(token).balance, token.curveBackingRequired());
+        assertLt(address(token).balance - token.curveBackingRequired(), 1 gwei);
     }
 
-    function test_ClaimAuctionRefundsOverpayment() public {
+    function test_ClaimAuctionRefundsOverpayment() public seeded {
         uint256 id = token.currentAuctionId();
         uint256 price = token.auctionPrice(id);
 
@@ -240,7 +347,7 @@ contract HeadlessTest is Test {
         assertEq(alice.balance, aliceBefore - price);
     }
 
-    function test_ClaimAuctionTwiceReverts() public {
+    function test_ClaimAuctionTwiceReverts() public seeded {
         uint256 id = token.currentAuctionId();
         uint256 price = token.auctionPrice(id);
 
@@ -252,7 +359,7 @@ contract HeadlessTest is Test {
         token.claimAuction{value: price * 2}(id);
     }
 
-    function test_ClaimAuctionAfterWindowExpires() public {
+    function test_ClaimAuctionAfterWindowExpires() public seeded {
         uint256 id = token.currentAuctionId();
         vm.roll(block.number + token.AUCTION_WINDOW() + 1);
 
@@ -261,7 +368,7 @@ contract HeadlessTest is Test {
         token.claimAuction{value: 100 ether}(id);
     }
 
-    function test_ClaimAuctionUnderpaymentReverts() public {
+    function test_ClaimAuctionUnderpaymentReverts() public seeded {
         uint256 id = token.currentAuctionId();
         uint256 price = token.auctionPrice(id);
 
@@ -272,7 +379,7 @@ contract HeadlessTest is Test {
         token.claimAuction{value: price - 1}(id);
     }
 
-    function test_NextAuctionOpensAtNextInterval() public {
+    function test_NextAuctionOpensAtNextInterval() public seeded {
         uint256 id1 = token.currentAuctionId();
         uint256 price1 = token.auctionPrice(id1);
         vm.prank(alice);
@@ -395,7 +502,7 @@ contract HeadlessTest is Test {
     }
 
     /// @notice A claimAuction with exactly the right payment leaves no refund.
-    function test_ClaimAuctionExactPaymentNoRefund() public {
+    function test_ClaimAuctionExactPaymentNoRefund() public seeded {
         uint256 id = token.currentAuctionId();
         uint256 price = token.auctionPrice(id);
         uint256 aliceBefore = alice.balance;
@@ -614,7 +721,7 @@ contract HeadlessTest is Test {
     }
 
     /// @notice claimAuction with overpayment to a hostile receiver must revert.
-    function test_ClaimAuctionRevertsIfRefundCallFails() public {
+    function test_ClaimAuctionRevertsIfRefundCallFails() public seeded {
         HostileReceiver hostile = new HostileReceiver();
         vm.deal(address(hostile), 100 ether);
 
@@ -680,24 +787,46 @@ contract HeadlessTest is Test {
         assertEq(alice.balance - before, refund);
     }
 
-    /// @notice Auction must be claimable at exactly `openBlock + AUCTION_WINDOW`
-    ///         (the inclusive close block). Kills AOR_57 (closeBlock formula).
-    function test_AuctionClaimableAtExactCloseBlock() public {
+    /// @notice Auction window is half-open: claimable at `openBlock + WINDOW - 1`
+    ///         but NOT at `openBlock + WINDOW`. The latter is reserved as the
+    ///         opening block of the next auction id. This guarantees the
+    ///         premium is strictly > 0 on every claimable block (the floor
+    ///         is approached but never reached), preserving the
+    ///         "every trade pays a spread" symmetry. Kills AOR_57.
+    function test_AuctionClaimableAtLastBlockBeforeClose() public seeded {
         uint256 id = token.currentAuctionId();
         uint256 anchor = token.launchBlock();
 
-        // Roll to exactly the close block.
-        vm.roll(anchor + token.AUCTION_WINDOW());
+        // Roll to the last claimable block.
+        vm.roll(anchor + token.AUCTION_WINDOW() - 1);
 
-        // Should still be claimable (price is base, no premium left).
-        (, uint256 base, ) = token.quoteBuy(token.AUCTION_SIZE());
         uint256 price = token.auctionPrice(id);
-        assertEq(price, base);
+        // Premium is non-zero — strictly above curve cost.
+        (, uint256 base, ) = token.quoteBuy(token.AUCTION_SIZE());
+        assertGt(price, base);
 
         vm.deal(alice, price);
         vm.prank(alice);
         token.claimAuction{value: price}(id);
         assertEq(token.balanceOf(alice), token.AUCTION_SIZE());
+    }
+
+    /// @notice At exactly `openBlock + AUCTION_WINDOW`, the auction is no
+    ///         longer claimable — both `auctionPrice` and `claimAuction`
+    ///         must reject. Defends the half-open window.
+    function test_AuctionExpiredAtCloseBlock() public seeded {
+        uint256 id = token.currentAuctionId();
+        uint256 anchor = token.launchBlock();
+
+        vm.roll(anchor + token.AUCTION_WINDOW());
+
+        vm.expectRevert(Headless.AuctionNotOpen.selector);
+        token.auctionPrice(id);
+
+        vm.deal(alice, 100 ether);
+        vm.prank(alice);
+        vm.expectRevert(Headless.AuctionExpired.selector);
+        token.claimAuction{value: 100 ether}(id);
     }
 
     /// @notice TWAP `dt` must equal exactly `block.number - priorBlock`, not
@@ -857,7 +986,7 @@ contract HeadlessTest is Test {
     }
 
     /// @notice Same property for `claimAuction`. Kills ROR_52 / ROR_54 / MIA_32.
-    function test_ClaimAuctionExactPaymentSkipsRefundPath() public {
+    function test_ClaimAuctionExactPaymentSkipsRefundPath() public seeded {
         HostileReceiver hostile = new HostileReceiver();
         vm.deal(address(hostile), 100 ether);
 
