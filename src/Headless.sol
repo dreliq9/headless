@@ -75,8 +75,18 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
     uint256 public constant BPS_DENOM  = 10_000;
 
     // ─── DUTCH AUCTION ─────────────────────────────────────────────────
-    uint256 public constant AUCTION_INTERVAL     = 25;         // blocks between auctions
-    uint256 public constant AUCTION_WINDOW       = 25;         // blocks of Dutch decay (back-to-back)
+    /// @notice Blocks between consecutive auction openings. Constructor-set
+    ///         (immutable) so deployers on chains with different block
+    ///         cadences (Ethereum L1 ~12 s vs Base/Arbitrum ~250 ms) can
+    ///         pick a wall-clock interval that matches their target. The
+    ///         "no off-chain dependency" promise is preserved — the value
+    ///         is fixed forever at deploy and is part of the constructor's
+    ///         transparent provenance.
+    uint256 public immutable AUCTION_INTERVAL;
+    /// @notice Number of blocks the Dutch decay runs for. Must be > 0 and
+    ///         ≤ AUCTION_INTERVAL (otherwise consecutive auctions would
+    ///         overlap and create ambiguous claim windows).
+    uint256 public immutable AUCTION_WINDOW;
     uint256 public constant AUCTION_SIZE         = 1_000 ether;// HDLS per auction
     uint256 public constant AUCTION_PREMIUM_BPS  = 2_000;      // 20% initial premium
 
@@ -98,6 +108,17 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
 
     /// @dev Lifetime excess swept into curveBase — a monotonic yield counter.
     uint256 public totalRebased;
+
+    /// @notice Per-address taint tracking for the founder allocation. Tokens
+    ///         carrying taint cannot be burned via `redeem` — they may only
+    ///         be transferred between accounts. Taint propagates on every
+    ///         transfer (rounded UP for stickiness) so the founder cannot
+    ///         escape the lock by routing the 3% allocation through a fresh
+    ///         address. This is the load-bearing enforcement of the
+    ///         "founder is mechanically last in line on exit" promise — the
+    ///         original `tokensSold` counter alone was insufficient because
+    ///         it could not distinguish a buyer's burn from a founder's burn.
+    mapping(address => uint256) public founderTaint;
 
     // ─── EVENTS ────────────────────────────────────────────────────────
     event Bought(
@@ -126,6 +147,10 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
     );
     event Rebased(uint256 excess, uint256 newCurveBase, uint256 totalRebased);
     event Poked(address indexed caller, uint256 excess);
+    /// @notice Emitted when the contract receives ETH directly (selfdestruct,
+    ///         coinbase reward, or unsolicited send via `receive()`). Lets
+    ///         off-chain planners observe donations without diffing balances.
+    event Donated(address indexed from, uint256 amount);
 
     // ─── ERRORS ────────────────────────────────────────────────────────
     error ZeroAmount();
@@ -138,14 +163,64 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
     error AuctionNotOpen();
     error AuctionExpired();
     error AuctionAlreadyClaimed();
+    error FounderTaintLocked();
+    error InvalidAuctionConfig();
+    error TwapNotChronological();
 
-    constructor() ERC20("Headless", "HDLS") ERC20Permit("Headless") {
+    /// @param _auctionInterval blocks between consecutive auction openings
+    /// @param _auctionWindow   blocks of Dutch decay per auction (≤ interval)
+    constructor(uint256 _auctionInterval, uint256 _auctionWindow)
+        ERC20("Headless", "HDLS")
+        ERC20Permit("Headless")
+    {
+        if (_auctionInterval == 0 || _auctionWindow == 0) revert InvalidAuctionConfig();
+        if (_auctionWindow > _auctionInterval) revert InvalidAuctionConfig();
+
+        AUCTION_INTERVAL = _auctionInterval;
+        AUCTION_WINDOW   = _auctionWindow;
+
         founder             = msg.sender;
         launchBlock         = block.number;
         lastCumulativeBlock = block.number;
         curveBase           = INITIAL_CURVE_BASE;
 
         _mint(msg.sender, FOUNDER_ALLOCATION);
+        founderTaint[msg.sender] = FOUNDER_ALLOCATION;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //                       FOUNDER TAINT PROPAGATION
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// @dev Override the OZ ERC20 unified hook to propagate founder taint on
+    ///      every account-to-account transfer. Burns and mints leave taint
+    ///      alone:
+    ///        - mint (from == 0): no taint to move; the only mint that ever
+    ///          creates taint is the founder mint in the constructor, which
+    ///          sets `founderTaint` directly.
+    ///        - burn (to == 0): the `redeem` function checks BEFORE calling
+    ///          `_burn` that the post-burn balance is still ≥ the caller's
+    ///          taint, so the burn never reaches into tainted balance. Taint
+    ///          for the burned address therefore stays exactly the same.
+    ///        - transfer (both non-zero): move taint proportionally, rounded
+    ///          UP, capped at the sender's current taint. Round-up keeps
+    ///          taint at-least-proportional so the founder cannot dilute it.
+    function _update(address from, address to, uint256 value) internal override {
+        super._update(from, to, value);
+        if (from == address(0) || to == address(0)) return;
+
+        uint256 fromTaint = founderTaint[from];
+        if (fromTaint == 0) return;
+
+        // `super._update` has already debited `from`, so the pre-transfer
+        // balance is the current balance plus `value`.
+        uint256 fromBalPre = balanceOf(from) + value;
+        // Round UP so taint moves at-least-proportionally with the tokens.
+        uint256 taintMove = (fromTaint * value + fromBalPre - 1) / fromBalPre;
+        if (taintMove > fromTaint) taintMove = fromTaint;
+
+        founderTaint[from] = fromTaint - taintMove;
+        founderTaint[to]  += taintMove;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -306,6 +381,11 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
         if (amount % 1 ether != 0) revert NotWholeTokens();
         if (balanceOf(msg.sender) < amount) revert InsufficientBalance();
         if (amount > tokensSold) revert InsufficientCurveSupply();
+        // Founder allocation cannot be curve-redeemed. The post-burn balance
+        // must still cover whatever founder taint the caller is holding.
+        if (balanceOf(msg.sender) - amount < founderTaint[msg.sender]) {
+            revert FounderTaintLocked();
+        }
 
         uint256 base   = _curveIntegral(tokensSold - amount, amount);
         uint256 fee    = (base * FEE_BPS) / BPS_DENOM;
@@ -352,10 +432,26 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
     ///         intermediate truncation. Equivalent to
     ///             maxPremium * (WINDOW - elapsed) / WINDOW
     ///         but with all terms combined under a single division.
+    ///
+    ///         ⚠ The auction *floor* (`baseCost`) is computed against the
+    ///         live `tokensSold` and `curveBase`. Both can change between
+    ///         the moment an agent reads this view and the moment they
+    ///         submit a `claimAuction` transaction (any intervening buy/
+    ///         redeem/rebase moves the floor). Treat the returned price
+    ///         as a *current* quote, not a guaranteed settlement price.
+    ///         Re-query immediately before submitting, or accept that you
+    ///         may overpay slightly via the natural overpayment-refund
+    ///         path which already returns excess ETH to the caller.
+    ///
+    ///         The window is **half-open**: `[openBlock, openBlock + WINDOW)`.
+    ///         Block `openBlock + WINDOW` is NOT claimable; the next auction
+    ///         opens there. This guarantees the spread is non-zero on every
+    ///         claimable block (the floor is approached but never reached),
+    ///         preserving the "every trade pays a spread fee" symmetry.
     function auctionPriceAt(uint256 id, uint256 atBlock) public view returns (uint256) {
         uint256 openBlock  = auctionOpenBlock(id);
         uint256 closeBlock = openBlock + AUCTION_WINDOW;
-        if (atBlock < openBlock || atBlock > closeBlock) revert AuctionNotOpen();
+        if (atBlock < openBlock || atBlock >= closeBlock) revert AuctionNotOpen();
 
         uint256 baseCost       = _curveIntegral(tokensSold, AUCTION_SIZE);
         uint256 remaining      = AUCTION_WINDOW - (atBlock - openBlock);
@@ -376,10 +472,22 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
 
         if (auctionClaimed[id]) revert AuctionAlreadyClaimed();
 
+        // No auction may settle before the curve has at least one buyer.
+        // Otherwise the very first auction is claimable in the deploy block,
+        // and the claimer's premium gets rebased back across the tokens they
+        // just minted (the founder is excluded from the rebase distribution
+        // because rebase divides by `tokensSold`, not `totalSupply`). The
+        // gate auto-unblocks the moment any non-founder calls `buy`.
+        if (tokensSold == 0) revert AuctionNotOpen();
+
         uint256 openBlock  = auctionOpenBlock(id);
         uint256 closeBlock = openBlock + AUCTION_WINDOW;
         if (block.number < openBlock) revert AuctionNotOpen();
-        if (block.number > closeBlock) revert AuctionExpired();
+        // Half-open window: closeBlock itself is not claimable. This keeps
+        // the premium strictly > 0 on every claimable block, preserving the
+        // "every trade pays a spread" symmetry the rest of the contract
+        // already enforces on `buy` and `redeem`.
+        if (block.number >= closeBlock) revert AuctionExpired();
 
         if (tokensSold + AUCTION_SIZE + FOUNDER_ALLOCATION > MAX_SUPPLY) revert ExceedsMaxSupply();
 
@@ -428,9 +536,15 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
         view
         returns (uint256)
     {
+        // Reject inputs that don't form a valid time window. Without these
+        // checks the function reverts with a raw arithmetic underflow, which
+        // is harder for off-chain consumers to distinguish from a genuine
+        // contract bug.
+        if (priorBlock > block.number) revert TwapNotChronological();
         // Include the unaccumulated tail from lastCumulativeBlock to now.
         uint256 tail = curveBase * (block.number - lastCumulativeBlock);
         uint256 nowCumulative = cumulativeCurveBase + tail;
+        if (priorCumulative > nowCumulative) revert TwapNotChronological();
         uint256 dt = block.number - priorBlock;
         if (dt == 0) return curveBase;
         return (nowCumulative - priorCumulative) / dt;
@@ -481,6 +595,10 @@ contract Headless is ERC20, ERC20Permit, ReentrancyGuardTransient {
 
     /// @notice Allow the contract to receive direct ETH transfers (selfdestruct,
     ///         coinbase, or donations). Anyone can call `poke()` afterwards to
-    ///         sweep the donation into curveBase for every holder.
-    receive() external payable {}
+    ///         sweep the donation into curveBase for every holder. Emits
+    ///         `Donated` so off-chain planners can observe the inflow without
+    ///         diffing balances.
+    receive() external payable {
+        if (msg.value > 0) emit Donated(msg.sender, msg.value);
+    }
 }

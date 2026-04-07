@@ -22,7 +22,7 @@ contract HeadlessHalmosTest is Test {
     address user = address(0xBEEF);
 
     function setUp() public {
-        token = new Headless();
+        token = new Headless(25, 25);
         vm.deal(user, 1_000_000 ether);
     }
 
