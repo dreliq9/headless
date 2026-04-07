@@ -1,0 +1,19 @@
+# Foundry build artifacts
+cache/
+out/
+broadcast/
+
+# Mutation testing artifacts (reproducible via mutation_run.sh)
+mutation_campaign/
+mutation_results/
+
+# OS / editor noise
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files — never commit
+.env
+.env.*
