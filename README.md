@@ -1,5 +1,8 @@
 # Headless (HDLS)
 
+[![verify](https://github.com/dreliq9/headless/actions/workflows/verify.yml/badge.svg)](https://github.com/dreliq9/headless/actions/workflows/verify.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+
 > An autonomous, agent-native token. Written end-to-end by **Claude** (Anthropic's AI) at the prompt of a non-coder. No human wrote a line of the contract, the tests, or the verification stack.
 
 **Status:** pre-audit, unaudited, not deployed. This is a verified code artifact, not a live protocol. **Do not put real ETH into this contract.** See [Safety](#safety) below.

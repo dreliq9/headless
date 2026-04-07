@@ -1,0 +1,129 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───────────────────────── Tiers 1-3 ──────────────────────────────
+  # Unit tests, fuzz properties, and stateful invariants (1.28M calls).
+  test:
+    name: Unit · Fuzz · Invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Forge version
+        run: forge --version
+
+      - name: Build
+        run: forge build --sizes
+
+      - name: Unit and fuzz tests (52 tests + 2 fuzz × 256 runs)
+        run: forge test --no-match-contract 'Headless(Invariant|Halmos)'
+
+      - name: Stateful invariants (10 invariants × 128k calls = 1.28M)
+        run: forge test --match-contract HeadlessInvariant
+
+  # ────────────────────────── Tier 4 ────────────────────────────────
+  # Slither static analysis. Fails on medium or higher severity.
+  # Informational findings (low-level-calls) are expected and allowed.
+  slither:
+    name: Tier 4 · Slither static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - name: Slither
+        uses: crytic/slither-action@v0.4.0
+        with:
+          target: '.'
+          slither-args: --filter-paths "lib/" --exclude-informational --exclude-low
+          fail-on: medium
+
+  # ────────────────────────── Tier 5 ────────────────────────────────
+  # Halmos symbolic verification. Proves 4 load-bearing properties
+  # across the full symbolic path space (bounded amounts).
+  halmos:
+    name: Tier 5 · Halmos symbolic verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Halmos
+        run: pip install halmos
+
+      - name: Symbolic proofs
+        run: halmos --match-contract HeadlessHalmosTest
+
+  # ────────────────────────── Tier 6 ────────────────────────────────
+  # Mutation testing — slow (~15 min), runs only on:
+  #   • manual workflow_dispatch from the Actions tab, OR
+  #   • a pull request labelled `run-mutation`
+  mutation:
+    name: Tier 6 · Mutation testing (on label or dispatch)
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-mutation')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install slither-mutate
+        run: pip install slither-analyzer
+
+      - name: Generate mutants (8 operator categories, ~328 mutants)
+        run: |
+          slither-mutate src/Headless.sol \
+            --test-cmd "forge test --no-match-contract 'Headless(Invariant|Halmos)' -q" \
+            --output-dir mutation_campaign \
+            --timeout 120 || true
+          echo "Generated $(ls mutation_campaign/Headless/ 2>/dev/null | wc -l) mutants"
+
+      - name: Run custom mutation driver
+        run: bash mutation_run.sh
+
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutation-results
+          path: mutation_results/
