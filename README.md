@@ -262,7 +262,7 @@ Bug reports, "this mechanism is wrong because X" feedback, and methodological cr
 
 ## Contact
 
-Methodological critique, review requests, or questions about the case study: open an issue, or reach me at `headless@dreliq9.dev`.
+Methodological critique, review requests, or questions about the case study: please open an issue on this repository.
 
 ---
 
